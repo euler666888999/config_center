@@ -58,7 +58,10 @@ type CreateSecretRequest struct {
 
 // RotateRequest 触发轮换请求。
 type RotateRequest struct {
-	GracePeriodHours int `json:"grace_period_hours"`
+	GracePeriodHours int    `json:"grace_period_hours"`
+	Plaintext        string `json:"plaintext"`  // 可选明文，服务端将使用 KMS 加密
+	Ciphertext       string `json:"ciphertext"` // 可选密文，优先使用明文加密结果
+	KeyID            string `json:"key_id"`     // 可选指定使用的 KMS Key，默认沿用上一版本
 }
 
 // AuditQueryRequest 审计查询请求。

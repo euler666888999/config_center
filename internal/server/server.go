@@ -344,6 +344,10 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, name
 		respondError(w, http.StatusBadRequest, "请求体必须为 JSON")
 		return
 	}
+	if req.Plaintext == "" && req.Ciphertext == "" {
+		respondError(w, http.StatusBadRequest, "轮换需提供 plaintext 或 ciphertext")
+		return
+	}
 	now := time.Now()
 	actor := getActor(r)
 
@@ -370,12 +374,25 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, name
 	if active != nil {
 		oldActiveVersion = active.Version
 	}
-	// 轮换生成新版本，这里使用占位密文，真实场景应由客户端提交。
+	// 轮换生成新版本，要求客户端提供明文或密文，服务端做封装以避免落盘明文
+	ciphertext := req.Ciphertext
+	if req.Plaintext != "" {
+		enc, err := s.kms.Encrypt([]byte(req.Plaintext))
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, fmt.Sprintf("加密新版本失败: %v", err))
+			return
+		}
+		ciphertext = enc
+	}
+	keyID := latest.KeyID
+	if req.KeyID != "" {
+		keyID = req.KeyID
+	}
 	newSecret := &model.SecretVersion{
 		Namespace:  namespace,
 		Name:       name,
-		Ciphertext: "ROTATED_PLACEHOLDER_PENDING",
-		KeyID:      latest.KeyID,
+		Ciphertext: ciphertext,
+		KeyID:      keyID,
 		Labels:     latest.Labels,
 		Status:     "staged",
 		CreatedBy:  actor,
@@ -388,13 +405,6 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, name
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("轮换失败: %v", err))
 		return
 	}
-	// 真实场景应客户端提交密文，这里模拟生成随机密文并封装
-	newCipher, err := s.kms.Encrypt([]byte(fmt.Sprintf("ROTATED_VERSION_%d", newVersion)))
-	if err != nil {
-		respondError(w, http.StatusInternalServerError, fmt.Sprintf("加密新版本失败: %v", err))
-		return
-	}
-	newSecret.Ciphertext = newCipher
 	_ = s.store.RecordAudit(ctx, &model.AuditLog{
 		Namespace: namespace,
 		Name:      name,
