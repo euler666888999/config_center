@@ -45,7 +45,9 @@ func (m *MemoryStore) FindActive(_ context.Context, namespace, name string) (*mo
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	key := m.key(namespace, name)
-	for _, v := range m.secrets[key] {
+	versions := m.secrets[key]
+	for i := len(versions) - 1; i >= 0; i-- {
+		v := versions[i]
 		if v.Status == "active" {
 			return v, nil
 		}
@@ -127,6 +129,9 @@ func (m *MemoryStore) SetActive(_ context.Context, namespace, name string, versi
 func (m *MemoryStore) RecordAudit(_ context.Context, a *model.AuditLog) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
 	m.audits = append(m.audits, a)
 	return nil
 }

@@ -1,7 +1,8 @@
 databases/
-doc/
 .idea/
 .gocache/
 .gomodcache/
 .gosubmodcache/
 img.png
+doc/
+cmd/integration_test/

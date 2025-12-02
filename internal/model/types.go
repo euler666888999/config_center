@@ -28,6 +28,7 @@ type AuditLog struct {
 	Version   int       `json:"version,omitempty"`
 	Result    string    `json:"result"`
 	Detail    string    `json:"detail,omitempty"`
+	Signature string    `json:"signature,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -43,6 +44,7 @@ type Policy struct {
 	Conditions map[string]any `json:"conditions,omitempty"`
 	CreatedBy  string         `json:"created_by"`
 	CreatedAt  time.Time      `json:"created_at"`
+	Quota      int            `json:"quota,omitempty"` // 可选配额，0 表示不限制
 }
 
 // CreateSecretRequest 创建密钥的请求体。

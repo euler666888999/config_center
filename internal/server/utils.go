@@ -1,10 +1,15 @@
 package server
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"strings"
+	"time"
 
 	"config_center/internal/model"
 )
@@ -78,4 +83,25 @@ func versionOrZeroPointer(v int) any {
 		return nil
 	}
 	return v
+}
+
+// signAudit 生成审计日志的 HMAC-SHA256 签名，确保防篡改。
+func signAudit(a *model.AuditLog, key string) string {
+	if key == "" {
+		return ""
+	}
+	mac := hmac.New(sha256.New, []byte(key))
+	payload := []string{
+		a.Namespace,
+		a.Name,
+		a.Action,
+		a.Actor,
+		a.ClientIP,
+		fmt.Sprintf("%d", a.Version),
+		a.Result,
+		a.Detail,
+		a.CreatedAt.Format(time.RFC3339Nano),
+	}
+	mac.Write([]byte(strings.Join(payload, "|")))
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }

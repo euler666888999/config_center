@@ -167,10 +167,13 @@ func (m *MySQLStore) SetActive(ctx context.Context, namespace, name string, vers
 }
 
 func (m *MySQLStore) RecordAudit(ctx context.Context, a *model.AuditLog) error {
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
 	_, err := m.db.ExecContext(ctx, `
-INSERT INTO audit_logs(namespace,name,action,actor,client_ip,version,result,detail,created_at)
-VALUES(?,?,?,?,?,?,?,?,?)`,
-		a.Namespace, a.Name, a.Action, a.Actor, a.ClientIP, a.Version, a.Result, a.Detail, time.Now())
+INSERT INTO audit_logs(namespace,name,action,actor,client_ip,version,result,detail,signature,created_at)
+VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		a.Namespace, a.Name, a.Action, a.Actor, a.ClientIP, a.Version, a.Result, a.Detail, a.Signature, a.CreatedAt)
 	return err
 }
 

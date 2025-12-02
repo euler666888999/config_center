@@ -31,12 +31,23 @@ func main() {
 	}
 	defer st.Close()
 
-	if os.Getenv("KMS_MASTER_KEY") == "" {
-		log.Fatalf("必须设置 KMS_MASTER_KEY(Base64 32 字节) 以启用静态加密")
+	var kmsClient kms.KMS
+	var errKms error
+
+	switch cfg.KMSProvider {
+	case "aliyun":
+		kmsClient, errKms = kms.NewAliyunKMS()
+	case "local":
+		if os.Getenv("KMS_MASTER_KEY") == "" {
+			log.Fatalf("使用 local KMS 必须设置 KMS_MASTER_KEY(Base64 32 字节)")
+		}
+		kmsClient, errKms = kms.NewLocalKMS(os.Getenv("KMS_MASTER_KEY"))
+	default:
+		log.Fatalf("不支持的 KMS_PROVIDER: %s", cfg.KMSProvider)
 	}
-	kmsClient, err := kms.NewEnvelopeKMS(os.Getenv("KMS_MASTER_KEY"))
-	if err != nil {
-		log.Fatalf("初始化 KMS 客户端失败: %v", err)
+
+	if errKms != nil {
+		log.Fatalf("初始化 KMS 客户端失败: %v", errKms)
 	}
 
 	srv := server.NewServer(st, cfg, kmsClient)

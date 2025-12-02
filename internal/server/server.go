@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,14 +20,37 @@ import (
 
 // Server 聚合路由与存储。
 type Server struct {
-	store store.Store
-	cfg   config.Config
-	kms   *kms.EnvelopeKMS
+	store       store.Store
+	cfg         config.Config
+	kms         kms.KMS
+	watcher     *Watcher
+	jwks        *jwksCache
+	oidcPub     *rsa.PublicKey
+	rateLimiter *rateLimiter
+	idemStore   *idempotencyStore
 }
 
 // NewServer 创建服务器实例。
-func NewServer(store store.Store, cfg config.Config, kms *kms.EnvelopeKMS) *Server {
-	return &Server{store: store, cfg: cfg, kms: kms}
+func NewServer(store store.Store, cfg config.Config, kms kms.KMS) *Server {
+	s := &Server{
+		store:       store,
+		cfg:         cfg,
+		kms:         kms,
+		watcher:     NewWatcher(),
+		rateLimiter: newRateLimiter(20, 50, time.Minute*5),
+		idemStore:   newIdempotencyStore(time.Minute * 10),
+	}
+	if cfg.OIDCJWKSURL != "" {
+		s.jwks = newJWKSCache(cfg.OIDCJWKSURL)
+	}
+	if cfg.OIDCPublicKey != "" {
+		key, err := parsePEMPublicKey(cfg.OIDCPublicKey)
+		if err != nil {
+			panic(fmt.Sprintf("解析 OIDC_PUBLIC_KEY 失败: %v", err))
+		}
+		s.oidcPub = key
+	}
+	return s
 }
 
 // Router 返回注册好路由的 mux。
@@ -42,7 +66,7 @@ func (s *Server) Router() *http.ServeMux {
 
 // Init 执行启动时的引导操作（如注入初始策略）。
 func (s *Server) Init(ctx context.Context) {
-	s.seedBootstrapPolicy(ctx)
+	// 默认拒绝，不再自动添加全局放行策略
 }
 
 // handleHealthz 健康探针。
@@ -106,6 +130,10 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 
 	// 创建密钥：/v1/namespaces/{ns}/secrets
 	if len(segments) == 4 {
+		if !s.checkIdempotency(r, actor, namespace, "create:"+segments[2]) {
+			respondError(w, http.StatusConflict, "重复的 Idempotency-Key")
+			return
+		}
 		s.handleCreateSecret(w, r.WithContext(context.WithValue(r.Context(), ctxActorKey{}, actor)), namespace)
 		return
 	}
@@ -119,6 +147,10 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		return
 	case strings.HasSuffix(nameSegment, ":rotate"):
 		name := strings.TrimSuffix(nameSegment, ":rotate")
+		if !s.checkIdempotency(r, actor, namespace, "rotate:"+name) {
+			respondError(w, http.StatusConflict, "重复的 Idempotency-Key")
+			return
+		}
 		s.handleRotateSecret(w, r.WithContext(context.WithValue(r.Context(), ctxActorKey{}, actor)), namespace, name)
 		return
 	case strings.HasSuffix(nameSegment, ":watch"):
@@ -134,6 +166,10 @@ func (s *Server) handleNamespaces(w http.ResponseWriter, r *http.Request) {
 		version, err := strconv.Atoi(versionStr)
 		if err != nil || version <= 0 {
 			respondError(w, http.StatusBadRequest, "版本号必须为正整数")
+			return
+		}
+		if !s.checkIdempotency(r, actor, namespace, fmt.Sprintf("activate:%s:%d", name, version)) {
+			respondError(w, http.StatusConflict, "重复的 Idempotency-Key")
 			return
 		}
 		s.handleActivateVersion(w, r.WithContext(context.WithValue(r.Context(), ctxActorKey{}, actor)), namespace, name, version)
@@ -208,7 +244,7 @@ func (s *Server) handleCreateSecret(w http.ResponseWriter, r *http.Request, name
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("创建密钥失败: %v", err))
 		return
 	}
-	_ = s.store.RecordAudit(ctx, &model.AuditLog{
+	s.recordAudit(ctx, r, &model.AuditLog{
 		Namespace: namespace,
 		Name:      req.Name,
 		Action:    "write",
@@ -225,6 +261,10 @@ func (s *Server) handleCreateSecret(w http.ResponseWriter, r *http.Request, name
 		"version": version,
 		"status":  status,
 	})
+	// 如果直接创建为 active，通知监听者
+	if status == "active" {
+		s.watcher.Notify(namespace, req.Name, version)
+	}
 }
 
 func (s *Server) handleGetSecret(w http.ResponseWriter, r *http.Request, namespace, name string) {
@@ -274,9 +314,8 @@ func (s *Server) handleGetSecret(w http.ResponseWriter, r *http.Request, namespa
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("解密失败: %v", err))
 		return
 	}
-	target.Ciphertext = "" // 避免在日志中泄露
 
-	_ = s.store.RecordAudit(ctx, &model.AuditLog{
+	s.recordAudit(ctx, r, &model.AuditLog{
 		Namespace: namespace,
 		Name:      name,
 		Action:    "read",
@@ -316,7 +355,7 @@ func (s *Server) handleActivateVersion(w http.ResponseWriter, r *http.Request, n
 		return
 	}
 	now := time.Now()
-	_ = s.store.RecordAudit(ctx, &model.AuditLog{
+	s.recordAudit(ctx, r, &model.AuditLog{
 		Namespace: namespace,
 		Name:      name,
 		Action:    "activate",
@@ -335,6 +374,7 @@ func (s *Server) handleActivateVersion(w http.ResponseWriter, r *http.Request, n
 		"version": version,
 		"status":  "active",
 	})
+	s.watcher.Notify(namespace, name, version)
 }
 
 func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, namespace, name string) {
@@ -405,7 +445,7 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, name
 		respondError(w, http.StatusInternalServerError, fmt.Sprintf("轮换失败: %v", err))
 		return
 	}
-	_ = s.store.RecordAudit(ctx, &model.AuditLog{
+	s.recordAudit(ctx, r, &model.AuditLog{
 		Namespace: namespace,
 		Name:      name,
 		Action:    "rotate",
@@ -425,63 +465,32 @@ func (s *Server) handleRotateSecret(w http.ResponseWriter, r *http.Request, name
 	})
 }
 
-// handleWatchSecret 使用长轮询，若无变更返回 304。
-func (s *Server) handleWatchSecret(w http.ResponseWriter, r *http.Request, namespace, name string) {
-	ctx := r.Context()
-	actor := getActor(r)
-	if err := s.authorize(ctx, namespace, name, "watch", actor); err != nil {
-		respondError(w, http.StatusForbidden, err.Error())
-		return
-	}
-	timeout := 25 * time.Second
-	deadline := time.Now().Add(timeout)
-	etag := r.Header.Get("If-None-Match")
-	var lastHash string
-	for {
-		active, _ := s.store.FindActive(ctx, namespace, name)
-		versions, _ := s.store.ListVersions(ctx, namespace, name)
-		var stagedVersion int
-		for _, v := range versions {
-			if v.Status == "staged" {
-				stagedVersion = v.Version
-				break
-			}
-		}
-		current := versionOrZero(active)
-		hash := etagValue(namespace, name, current, stagedVersion)
-		if hash != etag && hash != lastHash {
-			w.Header().Set("ETag", hash)
-			_ = s.store.RecordAudit(ctx, &model.AuditLog{
-				Namespace: namespace,
-				Name:      name,
-				Action:    "read",
-				Actor:     actor,
-				ClientIP:  clientIP(r),
-				Version:   current,
-				Result:    "success",
-				Detail:    "watch 长轮询返回快照",
-				CreatedAt: time.Now(),
-			})
-			respondJSON(w, http.StatusOK, map[string]any{
-				"name":           name,
-				"namespace":      namespace,
-				"active_version": current,
-				"staged_version": stagedVersion,
-				"timestamp":      time.Now().Format(time.RFC3339),
-			})
-			return
-		}
-		if time.Now().After(deadline) {
-			w.WriteHeader(http.StatusNotModified)
-			return
-		}
-		lastHash = hash
-		time.Sleep(2 * time.Second)
-	}
-}
-
 func etagValue(namespace, name string, active, staged int) string {
 	return `W/"` + namespace + "|" + name + "|" + strconv.Itoa(active) + "|" + strconv.Itoa(staged) + `"`
+}
+
+// recordAudit 统一生成签名并写入审计。
+func (s *Server) recordAudit(ctx context.Context, r *http.Request, a *model.AuditLog) {
+	if a.CreatedAt.IsZero() {
+		a.CreatedAt = time.Now()
+	}
+	if s.cfg.AuditHMACKey != "" {
+		a.Signature = signAudit(a, s.cfg.AuditHMACKey)
+	}
+	_ = s.store.RecordAudit(ctx, a)
+}
+
+// checkIdempotency 检查幂等键，重复则返回 false。
+func (s *Server) checkIdempotency(r *http.Request, actor, namespace, action string) bool {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		return true
+	}
+	// 清理过期幂等键
+	if s.idemStore != nil {
+		return s.idemStore.checkAndSet(actor + "|" + namespace + "|" + action + "|" + key)
+	}
+	return true
 }
 
 func (s *Server) handleAuditQuery(w http.ResponseWriter, r *http.Request) {

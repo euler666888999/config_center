@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"config_center/internal/abac"
 	"config_center/internal/model"
 )
 
@@ -36,6 +37,19 @@ func (s *Server) authorize(ctx context.Context, namespace, name, action, actor s
 		if !matchResource(p.Resources, name) {
 			continue
 		}
+		// ABAC 条件匹配
+		reqCtx := abac.Request{
+			Actor:     actor,
+			Namespace: namespace,
+			Resource:  name,
+			Action:    action,
+			Labels:    map[string]string{},
+			Attrs:     map[string]string{},
+		}
+		if !abac.Condition(toStringMap(p.Conditions)).Match(reqCtx) {
+			continue
+		}
+
 		if p.Effect == "deny" {
 			return errors.New("访问被策略拒绝")
 		}
@@ -76,6 +90,16 @@ func matchResource(resources []string, name string) bool {
 	return false
 }
 
+func toStringMap(m map[string]any) map[string]string {
+	res := make(map[string]string, len(m))
+	for k, v := range m {
+		if str, ok := v.(string); ok {
+			res[k] = str
+		}
+	}
+	return res
+}
+
 // seedBootstrapPolicy 当策略为空且指定了 Bootstrap 主体时写入一条全权限策略。
 func (s *Server) seedBootstrapPolicy(ctx context.Context) {
 	all, err := s.store.ListPolicies(ctx, "")
@@ -100,27 +124,60 @@ func (s *Server) seedBootstrapPolicy(ctx context.Context) {
 	}
 }
 
-// authenticate 校验身份，优先使用 mTLS 证书，其次使用 Authorization Bearer 或 X-Actor。
+// authenticate 校验身份，优先使用 mTLS 证书，其次使用 Authorization Bearer (OIDC/Static) 或 X-Actor。
 func (s *Server) authenticate(r *http.Request) (string, error) {
+	// 清理限流/幂等缓存，防止长期占用
+	if s.rateLimiter != nil && time.Since(s.rateLimiter.lastSweep) > time.Minute {
+		s.rateLimiter.cleanup()
+		s.rateLimiter.lastSweep = time.Now()
+	}
+	if s.idemStore != nil && time.Since(s.idemStore.lastSweep) > time.Minute {
+		s.idemStore.cleanup()
+		s.idemStore.lastSweep = time.Now()
+	}
+
 	var actor string
-	// mTLS 证书优先
+	// 1. mTLS 证书优先
 	if r.TLS != nil && len(r.TLS.VerifiedChains) > 0 && len(r.TLS.PeerCertificates) > 0 {
 		actor = r.TLS.PeerCertificates[0].Subject.CommonName
 	}
+	// 2. 开发/调试用的 X-Actor 头 (仅非生产环境或特定配置下允许，此处保留逻辑但建议生产禁用)
 	if actor == "" {
 		actor = r.Header.Get("X-Actor")
 	}
+
 	authHeader := r.Header.Get("Authorization")
-	token := ""
+	tokenString := ""
 	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
-		token = strings.TrimSpace(authHeader[7:])
+		tokenString = strings.TrimSpace(authHeader[7:])
 	}
 
-	// Bearer Token 校验（如果配置）
-	if s.cfg.BearerToken != "" && token != s.cfg.BearerToken {
-		// 若有 mTLS 已校验通过，可放行；否则要求 token
+	// 3. Bearer Token 校验
+	if tokenString != "" {
+		// 3.1 静态 Token 校验 (兼容旧逻辑)
+		if s.cfg.BearerToken != "" && tokenString == s.cfg.BearerToken {
+			// 静态 Token 验证通过，若 actor 为空则标记为 system 或保留 unknown
+			if actor == "" {
+				actor = "system-static"
+			}
+		} else {
+			// 3.2 OIDC JWT 校验
+			if s.cfg.OIDCPublicKey != "" || s.cfg.OIDCJWKSURL != "" {
+				sub, err := s.verifyOIDCToken(tokenString)
+				if err != nil {
+					return "", fmt.Errorf("OIDC 校验失败: %v", err)
+				}
+				if sub != "" && actor == "" {
+					actor = sub
+				}
+			} else if s.cfg.BearerToken != "" {
+				return "", errors.New("无效的 Token")
+			}
+		}
+	} else if s.cfg.BearerToken != "" || s.cfg.OIDCPublicKey != "" || s.cfg.OIDCJWKSURL != "" {
+		// 配置了 Token 校验但未携带，若没有 mTLS 则拒绝
 		if actor == "" || r.TLS == nil || len(r.TLS.VerifiedChains) == 0 {
-			return "", errors.New("缺少或无效的 Bearer Token")
+			return "", errors.New("缺少 Bearer Token")
 		}
 	}
 
@@ -131,6 +188,14 @@ func (s *Server) authenticate(r *http.Request) (string, error) {
 
 	if actor == "" {
 		actor = "unknown"
+	}
+	// 简单限流，按主体+IP
+	key := actor
+	if key == "" {
+		key = clientIP(r)
+	}
+	if s.rateLimiter != nil && !s.rateLimiter.allow(key) {
+		return "", errors.New("请求过于频繁")
 	}
 	return actor, nil
 }
