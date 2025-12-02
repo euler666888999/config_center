@@ -105,3 +105,11 @@ func signAudit(a *model.AuditLog, key string) string {
 	mac.Write([]byte(strings.Join(payload, "|")))
 	return base64.StdEncoding.EncodeToString(mac.Sum(nil))
 }
+
+// verifyAudit 对比签名。
+func verifyAudit(a *model.AuditLog, key string) bool {
+	if key == "" || a.Signature == "" {
+		return false
+	}
+	return hmac.Equal([]byte(a.Signature), []byte(signAudit(a, key)))
+}

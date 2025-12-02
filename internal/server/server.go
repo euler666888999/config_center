@@ -28,6 +28,7 @@ type Server struct {
 	oidcPub     *rsa.PublicKey
 	rateLimiter *rateLimiter
 	idemStore   *idempotencyStore
+	quota       *quotaTracker
 }
 
 // NewServer 创建服务器实例。
@@ -39,6 +40,7 @@ func NewServer(store store.Store, cfg config.Config, kms kms.KMS) *Server {
 		watcher:     NewWatcher(),
 		rateLimiter: newRateLimiter(20, 50, time.Minute*5),
 		idemStore:   newIdempotencyStore(time.Minute * 10),
+		quota:       newQuotaTracker(time.Hour),
 	}
 	if cfg.OIDCJWKSURL != "" {
 		s.jwks = newJWKSCache(cfg.OIDCJWKSURL)
@@ -546,6 +548,10 @@ func (s *Server) handleAuditQuery(w http.ResponseWriter, r *http.Request) {
 		end = len(all)
 	}
 	items := all[start:end]
+	for _, it := range items {
+		it.Detail = "" // 返回时默认隐藏 detail 以避免敏感信息，可按需放开
+		it.Signature = "" // 不下发签名，避免泄露密钥结构
+	}
 	respondJSON(w, http.StatusOK, map[string]any{
 		"items": items,
 		"total": len(all),

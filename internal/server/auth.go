@@ -50,6 +50,14 @@ func (s *Server) authorize(ctx context.Context, namespace, name, action, actor s
 			continue
 		}
 
+		// 配额控制（若设置）
+		if p.Quota > 0 && s.quota != nil {
+			key := fmt.Sprintf("%s|%s|%s|%s|%s", p.Namespace, name, action, p.Name, actor)
+			if !s.quota.allow(key, p.Quota) {
+				return errors.New("超出策略配额限制")
+			}
+		}
+
 		if p.Effect == "deny" {
 			return errors.New("访问被策略拒绝")
 		}
@@ -134,6 +142,10 @@ func (s *Server) authenticate(r *http.Request) (string, error) {
 	if s.idemStore != nil && time.Since(s.idemStore.lastSweep) > time.Minute {
 		s.idemStore.cleanup()
 		s.idemStore.lastSweep = time.Now()
+	}
+	if s.quota != nil && time.Since(s.quota.lastSweep) > time.Minute {
+		s.quota.cleanup()
+		s.quota.lastSweep = time.Now()
 	}
 
 	var actor string
