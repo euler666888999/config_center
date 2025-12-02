@@ -1,0 +1,7 @@
+databases/
+doc/
+.idea/
+.gocache/
+.gomodcache/
+.gosubmodcache/
+img.png
