@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,17 +12,32 @@ import (
 
 // MemoryStore 使用内存实现的简易存储，方便本地演示与接口验证。
 type MemoryStore struct {
-	mu       sync.RWMutex
-	secrets  map[string][]*model.SecretVersion // key = namespace|name
-	audits   []*model.AuditLog
-	policies []*model.Policy
-	policyID int64
+	mu         sync.RWMutex
+	secrets    map[string][]*model.SecretVersion // key = namespace|name
+	audits     []*model.AuditLog
+	policies   []*model.Policy
+	policyID   int64
+	idemKeys   map[string]time.Time
+	idemResp   map[string]map[string]any
+	quota      map[string]quotaRecord
+	metrics    map[string]int64
+	namespaces map[string]string // namespace -> description
+}
+
+type quotaRecord struct {
+	used int
+	exp  time.Time
 }
 
 // NewMemoryStore 初始化内存存储。
 func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
-		secrets: make(map[string][]*model.SecretVersion),
+		secrets:    make(map[string][]*model.SecretVersion),
+		idemKeys:   make(map[string]time.Time),
+		idemResp:   make(map[string]map[string]any),
+		quota:      make(map[string]quotaRecord),
+		metrics:    make(map[string]int64),
+		namespaces: make(map[string]string),
 	}
 }
 
@@ -34,6 +50,9 @@ func (m *MemoryStore) key(namespace, name string) string {
 func (m *MemoryStore) AppendSecretVersion(_ context.Context, sv *model.SecretVersion) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, ok := m.namespaces[sv.Namespace]; !ok {
+		return 0, fmt.Errorf("命名空间 %s 不存在", sv.Namespace)
+	}
 	key := m.key(sv.Namespace, sv.Name)
 	sv.Version = len(m.secrets[key]) + 1
 	m.secrets[key] = append(m.secrets[key], sv)
@@ -88,6 +107,24 @@ func (m *MemoryStore) ListVersions(_ context.Context, namespace, name string) ([
 	versions := m.secrets[key]
 	res := make([]*model.SecretVersion, 0, len(versions))
 	res = append(res, versions...)
+	return res, nil
+}
+
+// ListSecrets 列出指定命名空间下的所有密钥名称。
+func (m *MemoryStore) ListSecrets(_ context.Context, namespace string) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for key := range m.secrets {
+		parts := strings.SplitN(key, "|", 2)
+		if len(parts) == 2 && parts[0] == namespace {
+			seen[parts[1]] = struct{}{}
+		}
+	}
+	res := make([]string, 0, len(seen))
+	for name := range seen {
+		res = append(res, name)
+	}
 	return res, nil
 }
 
@@ -171,6 +208,12 @@ func (m *MemoryStore) AddPolicy(_ context.Context, p *model.Policy) (*model.Poli
 	defer m.mu.Unlock()
 	m.policyID++
 	p.ID = m.policyID
+	if p.Version == 0 {
+		p.Version = 1
+	}
+	if p.Approved && p.ApprovalState == "" {
+		p.ApprovalState = "approved"
+	}
 	m.policies = append(m.policies, p)
 	return p, nil
 }
@@ -198,24 +241,168 @@ func (m *MemoryStore) HasPolicies(_ context.Context) (bool, error) {
 	return len(m.policies) > 0, nil
 }
 
+// UpdatePolicyApproval 更新策略审批状态，返回更新后的策略及是否生效。
+func (m *MemoryStore) UpdatePolicyApproval(_ context.Context, id int64, version int, approver string, approve bool, reason string, ticket string) (*model.Policy, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.policies {
+		if p.ID == id {
+			if version > 0 && p.Version != version {
+				return nil, false, nil
+			}
+			if p.ApprovalState == "approved" || p.ApprovalState == "rejected" {
+				return p, false, nil
+			}
+			if p.RequiredApprovals <= 0 {
+				p.RequiredApprovals = 1
+			}
+			// 审批人校验：若指定 approvers，仅允许名单内审批
+			if len(p.Approvers) > 0 && approver != "" && !containsIgnoreCase(p.Approvers, approver) {
+				return nil, false, fmt.Errorf("审批人不在 approvers 名单中")
+			}
+			if approver != "" && !containsIgnoreCase(p.ApprovedBy, approver) {
+				p.ApprovedBy = append(p.ApprovedBy, approver)
+			}
+			p.TicketID = ticket
+			p.Reason = reason
+			if approve {
+				p.ApprovedSteps++
+				if p.ApprovedSteps >= p.RequiredApprovals {
+					now := time.Now()
+					p.ApprovalState = "approved"
+					p.Approved = true
+					p.ApprovedAt = &now
+				} else {
+					p.ApprovalState = "pending"
+				}
+			} else {
+				now := time.Now()
+				p.ApprovalState = "rejected"
+				p.Approved = false
+				p.ApprovedAt = &now
+			}
+			p.Version++
+			return p, true, nil
+		}
+	}
+	return nil, false, fmt.Errorf("未找到策略")
+}
+
 // NamespaceExists 内存模式认为命名空间必须显式创建。
 func (m *MemoryStore) NamespaceExists(_ context.Context, namespace string) (bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, versions := range m.secrets {
-		if len(versions) == 0 {
-			continue
-		}
-		if versions[0].Namespace == namespace {
-			return true, nil
-		}
-	}
-	return false, nil
+	_, ok := m.namespaces[namespace]
+	return ok, nil
 }
 
 // Ping 内存存储恒定可用。
 func (m *MemoryStore) Ping(_ context.Context) error {
 	return nil
+}
+
+// ReserveIdempotency 记录幂等键，重复返回 false。
+func (m *MemoryStore) ReserveIdempotency(_ context.Context, scope, key string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	full := scope + "|" + key
+	if _, ok := m.idemKeys[full]; ok {
+		return false, nil
+	}
+	m.idemKeys[full] = time.Now()
+	return true, nil
+}
+
+// SaveIdempotencyResponse 更新幂等键响应。
+func (m *MemoryStore) SaveIdempotencyResponse(_ context.Context, scope, key string, resp map[string]any) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idemResp[scope+"|"+key] = resp
+	m.metrics["idempotency_saved"]++
+	return nil
+}
+
+// GetIdempotencyResponse 读取幂等键响应。
+func (m *MemoryStore) GetIdempotencyResponse(_ context.Context, scope, key string) (map[string]any, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if resp, ok := m.idemResp[scope+"|"+key]; ok {
+		return resp, true, nil
+	}
+	_, ok := m.idemKeys[scope+"|"+key]
+	return nil, ok, nil
+}
+
+// UpdateQuota 更新配额，返回是否允许。
+func (m *MemoryStore) UpdateQuota(_ context.Context, policyID int64, actor, namespace, resource, action string, limit int, window time.Duration) (bool, error) {
+	if limit <= 0 {
+		return true, nil
+	}
+	key := fmt.Sprintf("%d|%s|%s|%s|%s", policyID, actor, namespace, resource, action)
+	now := time.Now()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.quota[key]
+	if !ok || now.After(rec.exp) {
+		m.quota[key] = quotaRecord{used: 1, exp: now.Add(window)}
+		return true, nil
+	}
+	if rec.used >= limit {
+		return false, nil
+	}
+	rec.used++
+	m.quota[key] = rec
+	m.metrics["quota_calls"]++
+	return true, nil
+}
+
+// ResetQuotas 清理配额记录，支持按命名空间治理。
+func (m *MemoryStore) ResetQuotas(_ context.Context, namespace string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		m.quota = make(map[string]quotaRecord)
+		return nil
+	}
+	for k := range m.quota {
+		if strings.Contains(k, "|"+namespace+"|") {
+			delete(m.quota, k)
+		}
+	}
+	return nil
+}
+
+// Metrics 返回内存存储的指标快照。
+func (m *MemoryStore) Metrics() map[string]int64 {
+	out := make(map[string]int64, len(m.metrics))
+	for k, v := range m.metrics {
+		out[k] = v
+	}
+	return out
+}
+
+// CreateNamespace 创建命名空间（存在时忽略）。
+func (m *MemoryStore) CreateNamespace(_ context.Context, namespace, desc string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if namespace == "" {
+		return fmt.Errorf("命名空间不能为空")
+	}
+	if _, ok := m.namespaces[namespace]; !ok {
+		m.namespaces[namespace] = desc
+	}
+	return nil
+}
+
+// ListNamespaces 返回全部命名空间名称。
+func (m *MemoryStore) ListNamespaces(_ context.Context) ([]string, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	res := make([]string, 0, len(m.namespaces))
+	for ns := range m.namespaces {
+		res = append(res, ns)
+	}
+	return res, nil
 }
 
 // Close 内存实现无资源需关闭。

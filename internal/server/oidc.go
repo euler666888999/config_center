@@ -25,6 +25,7 @@ type jwksCache struct {
 	expires time.Time
 }
 
+// newJWKSCache 创建 JWKS 缓存客户端，设置默认超时时间。
 func newJWKSCache(url string) *jwksCache {
 	return &jwksCache{
 		url:    url,
@@ -33,6 +34,7 @@ func newJWKSCache(url string) *jwksCache {
 	}
 }
 
+// getKey 从缓存或远端拉取 JWKS，返回指定 kid 的公钥。
 func (c *jwksCache) getKey(kid string) (*rsa.PublicKey, error) {
 	c.mu.RLock()
 	if key, ok := c.keys[kid]; ok && time.Now().Before(c.expires) {
@@ -52,6 +54,7 @@ func (c *jwksCache) getKey(kid string) (*rsa.PublicKey, error) {
 	return key, nil
 }
 
+// refresh 拉取最新 JWKS 文档并刷新本地缓存。
 func (c *jwksCache) refresh() error {
 	resp, err := c.client.Get(c.url)
 	if err != nil {
@@ -86,6 +89,7 @@ func (c *jwksCache) refresh() error {
 	return nil
 }
 
+// jwkToRSA 将 JWKS 中的 N/E 字段解析为 RSA 公钥。
 func jwkToRSA(n, e string) (*rsa.PublicKey, error) {
 	nb, err := base64.RawURLEncoding.DecodeString(n)
 	if err != nil {

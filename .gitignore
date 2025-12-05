@@ -6,3 +6,7 @@ databases/
 img.png
 doc/
 cmd/integration_test/
+deploy/
+Makefile
+scripts/
+.env

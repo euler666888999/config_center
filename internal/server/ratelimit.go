@@ -21,6 +21,7 @@ type bucket struct {
 	lastSeen time.Time
 }
 
+// newRateLimiter 创建按 key 区分的令牌桶限流器。
 func newRateLimiter(rate, burst int, ttl time.Duration) *rateLimiter {
 	return &rateLimiter{
 		buckets:   make(map[string]*bucket),
@@ -31,6 +32,7 @@ func newRateLimiter(rate, burst int, ttl time.Duration) *rateLimiter {
 	}
 }
 
+// allow 判断指定 key 是否获得令牌，若桶不存在则初始化。
 func (r *rateLimiter) allow(key string) bool {
 	now := time.Now()
 	r.mu.Lock()

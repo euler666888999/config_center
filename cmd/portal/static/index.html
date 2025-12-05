@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>配置中心</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+
+<body>
+    <div id="app">
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo"></div>
+                <span>配置中心</span>
+            </div>
+            <nav>
+                <a href="#dashboard" class="nav-item active" data-target="dashboard">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="3" width="7" height="7"></rect>
+                        <rect x="14" y="3" width="7" height="7"></rect>
+                        <rect x="14" y="14" width="7" height="7"></rect>
+                        <rect x="3" y="14" width="7" height="7"></rect>
+                    </svg>
+                    概览
+                </a>
+                <a href="#namespaces" class="nav-item" data-target="namespaces">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path
+                            d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z">
+                        </path>
+                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                        <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                    </svg>
+                    命名空间
+                </a>
+                <a href="#secrets" class="nav-item" data-target="secrets">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    密钥管理
+                </a>
+                <!-- <a href="#policies" class="nav-item" data-target="policies">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="16" y1="13" x2="8" y2="13"></line>
+                        <line x1="16" y1="17" x2="8" y2="17"></line>
+                        <polyline points="10 9 9 9 8 9"></polyline>
+                    </svg>
+                    策略审批
+                </a> -->
+                <a href="#audits" class="nav-item" data-target="audits">
+                    <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path>
+                        <polyline points="14 2 14 8 20 8"></polyline>
+                        <line x1="12" y1="18" x2="12" y2="12"></line>
+                        <line x1="9" y1="15" x2="15" y2="15"></line>
+                    </svg>
+                    审计日志
+                </a>
+            </nav>
+            <div class="user-profile">
+                <div class="avatar">U</div>
+                <div class="info">
+                    <span class="name">User</span>
+                    <span class="role">管理员</span>
+                </div>
+            </div>
+        </aside>
+
+        <main class="content">
+            <header class="top-bar">
+                <h1 id="page-title">概览</h1>
+                <div class="actions">
+                    <button id="refresh-btn" class="btn btn-secondary">
+                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+                            stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <polyline points="23 4 23 10 17 10"></polyline>
+                            <polyline points="1 20 1 14 7 14"></polyline>
+                            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+                        </svg>
+                        刷新
+                    </button>
+                    <button id="create-btn" class="btn btn-primary" style="display: none;">新建</button>
+                </div>
+            </header>
+
+            <div id="view-container">
+                <!-- Views will be injected here -->
+                <div id="dashboard-view" class="view active">
+                    <div class="stats-grid">
+                        <div class="stat-card">
+                            <h3>命名空间总数</h3>
+                            <div class="value" id="stat-namespaces">-</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>密钥总数</h3>
+                            <div class="value" id="stat-secrets">-</div>
+                        </div>
+                        <div class="stat-card">
+                            <h3>待审批</h3>
+                            <div class="value" id="stat-approvals">-</div>
+                        </div>
+                    </div>
+                </div>
+
+                <div id="namespaces-view" class="view">
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>描述</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="namespaces-list"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="secrets-view" class="view">
+                    <div class="filter-bar">
+                        <select id="secret-ns-filter" class="select-input">
+                            <option value="">选择命名空间...</option>
+                        </select>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="secrets-list"></tbody>
+                        </table>
+                    </div>
+                    <div id="secret-detail" class="detail-panel" style="display: none;">
+                        <h3>密钥详情: <span id="detail-name"></span></h3>
+                        <pre id="detail-content"></pre>
+                        <button class="btn btn-secondary" onclick="closeDetail()">关闭</button>
+                    </div>
+                </div>
+
+                <div id="policies-view" class="view">
+                    <div class="filter-bar">
+                        <select id="policy-ns-filter" class="select-input">
+                            <option value="">全部命名空间</option>
+                        </select>
+                        <select id="policy-status-filter" class="select-input">
+                            <option value="">全部状态</option>
+                            <option value="pending">待审批</option>
+                            <option value="approved">已通过</option>
+                            <option value="rejected">已拒绝</option>
+                        </select>
+                        <input type="text" id="policy-search" placeholder="搜索名称/主体/资源" class="text-input">
+                        <button id="policy-refresh-btn" class="btn btn-secondary">刷新</button>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>名称</th>
+                                    <th>命名空间</th>
+                                    <th>主体</th>
+                                    <th>资源</th>
+                                    <th>动作</th>
+                                    <th>Effect</th>
+                                    <th>状态</th>
+                                    <th>审批进度</th>
+                                    <th>版本</th>
+                                    <th>工单</th>
+                                    <th>操作</th>
+                                </tr>
+                            </thead>
+                            <tbody id="policies-list"></tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div id="audits-view" class="view">
+                    <div class="filter-bar">
+                        <select id="audit-ns" class="select-input">
+                            <option value="">所有命名空间</option>
+                        </select>
+                        <input type="text" id="audit-name" placeholder="资源名称" class="text-input">
+                        <button id="audit-query-btn" class="btn btn-secondary">查询</button>
+                    </div>
+                    <div class="table-container">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>时间</th>
+                                    <th>操作人</th>
+                                    <th>动作</th>
+                                    <th>命名空间</th>
+                                    <th>资源名</th>
+                                    <th>结果</th>
+                                </tr>
+                            </thead>
+                            <tbody id="audits-list"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <div id="modal-overlay" class="modal-overlay">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">标题</h3>
+                <button class="close-btn" onclick="closeModal()">×</button>
+            </div>
+            <div class="modal-body" id="modal-body">
+                <!-- Dynamic Content -->
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal()">取消</button>
+                <button class="btn btn-primary" id="modal-confirm-btn">确认</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js?v=2"></script>
+</body>
+
+</html>

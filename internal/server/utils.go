@@ -27,10 +27,34 @@ func respondJSON(w http.ResponseWriter, status int, payload any) {
 // respondError 输出错误信息，使用中文提示。
 func respondError(w http.ResponseWriter, status int, msg string) {
 	respondJSON(w, status, map[string]any{
-		"error":   msg,
-		"code":    status,
-		"message": msg,
+		"error":      msg,
+		"code":       status,
+		"error_code": errorCode(status),
+		"message":    msg,
 	})
+}
+
+// errorCode 提供统一错误码（国际化可扩展）。
+func errorCode(status int) string {
+	switch status {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusTooManyRequests:
+		return "RATE_LIMITED"
+	default:
+		if status >= 500 {
+			return "INTERNAL"
+		}
+		return "UNKNOWN"
+	}
 }
 
 // getActor 优先从上下文读取已认证主体，退化到 header。
@@ -62,6 +86,7 @@ func clientIP(r *http.Request) string {
 	return host
 }
 
+// isValidStatus 校验密钥状态是否合法。
 func isValidStatus(status string) bool {
 	switch status {
 	case "staged", "active", "deprecated", "disabled":
@@ -71,6 +96,7 @@ func isValidStatus(status string) bool {
 	}
 }
 
+// versionOrZero 将 SecretVersion 指针转换为版本号，nil 返回 0。
 func versionOrZero(sv *model.SecretVersion) int {
 	if sv == nil {
 		return 0
@@ -78,6 +104,7 @@ func versionOrZero(sv *model.SecretVersion) int {
 	return sv.Version
 }
 
+// versionOrZeroPointer 将 0 转为空接口 nil，用于响应体。
 func versionOrZeroPointer(v int) any {
 	if v == 0 {
 		return nil

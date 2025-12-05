@@ -34,17 +34,27 @@ type AuditLog struct {
 
 // Policy 表示简单的 RBAC/ABAC 策略。
 type Policy struct {
-	ID         int64          `json:"id"`
-	Name       string         `json:"name"`
-	Namespace  string         `json:"namespace"`
-	Subjects   []string       `json:"subjects"`
-	Resources  []string       `json:"resources"`
-	Actions    []string       `json:"actions"`
-	Effect     string         `json:"effect"`
-	Conditions map[string]any `json:"conditions,omitempty"`
-	CreatedBy  string         `json:"created_by"`
-	CreatedAt  time.Time      `json:"created_at"`
-	Quota      int            `json:"quota,omitempty"` // 可选配额，0 表示不限制
+	ID                int64          `json:"id"`
+	Name              string         `json:"name"`
+	Namespace         string         `json:"namespace"`
+	Subjects          []string       `json:"subjects"`
+	Resources         []string       `json:"resources"`
+	Actions           []string       `json:"actions"`
+	Effect            string         `json:"effect"`
+	Conditions        map[string]any `json:"conditions,omitempty"`
+	CreatedBy         string         `json:"created_by"`
+	CreatedAt         time.Time      `json:"created_at"`
+	Quota             int            `json:"quota,omitempty"` // 可选配额，0 表示不限制
+	Version           int            `json:"version,omitempty"`
+	Approved          bool           `json:"approved,omitempty"`
+	Reason            string         `json:"reason,omitempty"` // 审批/拒绝原因
+	ApprovalState     string         `json:"approval_state,omitempty"`
+	RequiredApprovals int            `json:"required_approvals,omitempty"`
+	ApprovedSteps     int            `json:"approved_steps,omitempty"`
+	Approvers         []string       `json:"approvers,omitempty"`   // 预期审批人列表
+	ApprovedBy        []string       `json:"approved_by,omitempty"` // 已审批人列表
+	ApprovedAt        *time.Time     `json:"approved_at,omitempty"`
+	TicketID          string         `json:"ticket_id,omitempty"` // 外部工单/审批单号
 }
 
 // CreateSecretRequest 创建密钥的请求体。
@@ -82,13 +92,19 @@ type AuditQueryRequest struct {
 
 // PolicyRequest 管理策略请求体。
 type PolicyRequest struct {
-	Action     string            `json:"action"`
-	Name       string            `json:"name"`
-	Namespace  string            `json:"namespace"`
-	Subjects   []string          `json:"subjects"`
-	Resources  []string          `json:"resources"`
-	Operations []string          `json:"actions"`
-	Effect     string            `json:"effect"`
-	Conditions map[string]string `json:"conditions"`
-	CreatedBy  string            `json:"created_by"`
+	Action            string            `json:"action"`
+	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
+	Subjects          []string          `json:"subjects"`
+	Resources         []string          `json:"resources"`
+	Operations        []string          `json:"actions"`
+	Effect            string            `json:"effect"`
+	Conditions        map[string]string `json:"conditions"`
+	CreatedBy         string            `json:"created_by"`
+	Version           int               `json:"version"` // 审批/更新时携带版本做并发校验
+	Reason            string            `json:"reason"`  // 审批通过/拒绝原因
+	RequiredApprovals int               `json:"required_approvals"`
+	Approvers         []string          `json:"approvers"`
+	TicketID          string            `json:"ticket_id"`
+	Decision          string            `json:"decision"` // approve/reject
 }

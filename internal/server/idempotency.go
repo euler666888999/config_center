@@ -33,6 +33,7 @@ func (s *idempotencyStore) checkAndSet(key string) bool {
 	return true
 }
 
+// cleanup 移除已过期的幂等键，防止内存占用。
 func (s *idempotencyStore) cleanup() {
 	now := time.Now()
 	s.mu.Lock()

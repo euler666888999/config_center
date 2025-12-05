@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"config_center/internal/model"
@@ -15,7 +16,8 @@ import (
 
 // MySQLStore 基于 MySQL 8.0 的存储实现，对应 databases/config_center_schema.sql。
 type MySQLStore struct {
-	db *sql.DB
+	db      *sql.DB
+	metrics map[string]int64
 }
 
 // NewMySQLStore 初始化 MySQL 连接。
@@ -31,7 +33,7 @@ func NewMySQLStore(dsn string) (*MySQLStore, error) {
 	if err := db.Ping(); err != nil {
 		return nil, fmt.Errorf("MySQL ping 失败: %w", err)
 	}
-	return &MySQLStore{db: db}, nil
+	return &MySQLStore{db: db, metrics: make(map[string]int64)}, nil
 }
 
 // Ping 提供健康检查。
@@ -58,7 +60,8 @@ func (m *MySQLStore) AppendSecretVersion(ctx context.Context, sv *model.SecretVe
 		return 0, err
 	}
 	var nextVersion int
-	err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0)+1 FROM secrets WHERE namespace_id=? AND name=?", nsID, sv.Name).Scan(&nextVersion)
+	// 加锁避免并发写入产生重复版本号
+	err = tx.QueryRowContext(ctx, "SELECT COALESCE(MAX(version),0)+1 FROM secrets WHERE namespace_id=? AND name=? FOR UPDATE", nsID, sv.Name).Scan(&nextVersion)
 	if err != nil {
 		return 0, err
 	}
@@ -74,6 +77,7 @@ VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 	if err != nil {
 		return 0, err
 	}
+	m.addMetric("append_success", 1)
 	if err := tx.Commit(); err != nil {
 		return 0, err
 	}
@@ -123,6 +127,29 @@ ORDER BY s.version ASC`, namespace, name)
 	return res, rows.Err()
 }
 
+// ListSecrets 列出指定命名空间下的所有密钥名称。
+func (m *MySQLStore) ListSecrets(ctx context.Context, namespace string) ([]string, error) {
+	rows, err := m.db.QueryContext(ctx, `
+SELECT DISTINCT s.name
+FROM secrets s
+JOIN namespaces n ON n.id = s.namespace_id
+WHERE n.namespace=?
+ORDER BY s.name ASC`, namespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		res = append(res, name)
+	}
+	return res, rows.Err()
+}
+
 func (m *MySQLStore) SetActive(ctx context.Context, namespace, name string, version int, actor string) (*model.SecretVersion, *model.SecretVersion, error) {
 	tx, err := m.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -143,7 +170,7 @@ func (m *MySQLStore) SetActive(ctx context.Context, namespace, name string, vers
 		return nil, nil, err
 	}
 	var oldActiveVersion *int
-	err = tx.QueryRowContext(ctx, "SELECT version FROM secrets WHERE namespace_id=? AND name=? AND status='active' ORDER BY version DESC LIMIT 1", nsID, name).Scan(&oldActiveVersion)
+	err = tx.QueryRowContext(ctx, "SELECT version FROM secrets WHERE namespace_id=? AND name=? AND status='active' ORDER BY version DESC LIMIT 1 FOR UPDATE", nsID, name).Scan(&oldActiveVersion)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, nil, err
 	}
@@ -170,10 +197,19 @@ func (m *MySQLStore) RecordAudit(ctx context.Context, a *model.AuditLog) error {
 	if a.CreatedAt.IsZero() {
 		a.CreatedAt = time.Now()
 	}
+	var detailVal any
+	if a.Detail != "" {
+		// 确保写入 JSON 类型的 detail 时是合法 JSON
+		if b, err := json.Marshal(map[string]any{"message": a.Detail}); err == nil {
+			detailVal = string(b)
+		} else {
+			detailVal = a.Detail
+		}
+	}
 	_, err := m.db.ExecContext(ctx, `
 INSERT INTO audit_logs(namespace,name,action,actor,client_ip,version,result,detail,signature,created_at)
 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		a.Namespace, a.Name, a.Action, a.Actor, a.ClientIP, a.Version, a.Result, a.Detail, a.Signature, a.CreatedAt)
+		a.Namespace, a.Name, a.Action, a.Actor, a.ClientIP, a.Version, a.Result, detailVal, a.Signature, a.CreatedAt)
 	return err
 }
 
@@ -240,10 +276,25 @@ func (m *MySQLStore) AddPolicy(ctx context.Context, p *model.Policy) (*model.Pol
 	resourcesJSON, _ := json.Marshal(p.Resources)
 	actionsJSON, _ := json.Marshal(p.Actions)
 	conditionsJSON, _ := json.Marshal(p.Conditions)
+	approversJSON, _ := json.Marshal(p.Approvers)
+	approvedByJSON, _ := json.Marshal(p.ApprovedBy)
+	if p.Version == 0 {
+		p.Version = 1
+	}
+	if p.RequiredApprovals <= 0 {
+		p.RequiredApprovals = 1
+	}
+	if p.ApprovalState == "" {
+		if p.Approved {
+			p.ApprovalState = "approved"
+		} else {
+			p.ApprovalState = "pending"
+		}
+	}
 	r, err := m.db.ExecContext(ctx, `
-INSERT INTO policies(name,namespace,subjects,resources,actions,effect,conditions,created_by,created_at)
-VALUES(?,?,?,?,?,?,?,?,?)`,
-		p.Name, p.Namespace, subjectsJSON, resourcesJSON, actionsJSON, p.Effect, conditionsJSON, p.CreatedBy, now)
+INSERT INTO policies(name,namespace,subjects,resources,actions,effect,conditions,created_by,created_at,quota,version,approved,reason,approval_state,required_approvals,approved_steps,approvers,approved_by,approved_at,ticket_id)
+VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		p.Name, p.Namespace, subjectsJSON, resourcesJSON, actionsJSON, p.Effect, conditionsJSON, p.CreatedBy, now, p.Quota, p.Version, p.Approved, p.Reason, p.ApprovalState, p.RequiredApprovals, p.ApprovedSteps, approversJSON, approvedByJSON, p.ApprovedAt, p.TicketID)
 	if err != nil {
 		return nil, err
 	}
@@ -254,7 +305,7 @@ VALUES(?,?,?,?,?,?,?,?,?)`,
 }
 
 func (m *MySQLStore) ListPolicies(ctx context.Context, namespace string) ([]*model.Policy, error) {
-	query := "SELECT id,name,namespace,subjects,resources,actions,effect,conditions,created_by,created_at FROM policies"
+	query := "SELECT id,name,namespace,subjects,resources,actions,effect,conditions,created_by,created_at,quota,version,approved,IFNULL(reason,''),approval_state,required_approvals,approved_steps,approvers,approved_by,approved_at,IFNULL(ticket_id,'') FROM policies"
 	args := make([]any, 0)
 	if namespace != "" {
 		query += " WHERE namespace=?"
@@ -267,9 +318,10 @@ func (m *MySQLStore) ListPolicies(ctx context.Context, namespace string) ([]*mod
 	defer rows.Close()
 	var res []*model.Policy
 	for rows.Next() {
-		var subjects, resources, actions, conditions []byte
+		var subjects, resources, actions, conditions, approvers, approvedBy []byte
+		var approvedAt sql.NullTime
 		p := &model.Policy{}
-		if err := rows.Scan(&p.ID, &p.Name, &p.Namespace, &subjects, &resources, &actions, &p.Effect, &conditions, &p.CreatedBy, &p.CreatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.Name, &p.Namespace, &subjects, &resources, &actions, &p.Effect, &conditions, &p.CreatedBy, &p.CreatedAt, &p.Quota, &p.Version, &p.Approved, &p.Reason, &p.ApprovalState, &p.RequiredApprovals, &p.ApprovedSteps, &approvers, &approvedBy, &approvedAt, &p.TicketID); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal(subjects, &p.Subjects)
@@ -277,6 +329,16 @@ func (m *MySQLStore) ListPolicies(ctx context.Context, namespace string) ([]*mod
 		_ = json.Unmarshal(actions, &p.Actions)
 		if len(conditions) > 0 {
 			_ = json.Unmarshal(conditions, &p.Conditions)
+		}
+		if len(approvers) > 0 {
+			_ = json.Unmarshal(approvers, &p.Approvers)
+		}
+		if len(approvedBy) > 0 {
+			_ = json.Unmarshal(approvedBy, &p.ApprovedBy)
+		}
+		if approvedAt.Valid {
+			t := approvedAt.Time
+			p.ApprovedAt = &t
 		}
 		res = append(res, p)
 	}
@@ -291,6 +353,119 @@ func (m *MySQLStore) HasPolicies(ctx context.Context) (bool, error) {
 	return count > 0, nil
 }
 
+func (m *MySQLStore) UpdatePolicyApproval(ctx context.Context, id int64, version int, approver string, approve bool, reason string, ticket string) (*model.Policy, bool, error) {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback()
+
+	row := tx.QueryRowContext(ctx, "SELECT id,name,namespace,subjects,resources,actions,effect,conditions,created_by,created_at,quota,version,approved,IFNULL(reason,''),approval_state,required_approvals,approved_steps,approvers,approved_by,approved_at,IFNULL(ticket_id,'') FROM policies WHERE id=? FOR UPDATE", id)
+	var p model.Policy
+	var subjects, resources, actions, conditions, approvers, approvedBy []byte
+	var approvedAt sql.NullTime
+	if err := row.Scan(&p.ID, &p.Name, &p.Namespace, &subjects, &resources, &actions, &p.Effect, &conditions, &p.CreatedBy, &p.CreatedAt, &p.Quota, &p.Version, &p.Approved, &p.Reason, &p.ApprovalState, &p.RequiredApprovals, &p.ApprovedSteps, &approvers, &approvedBy, &approvedAt, &p.TicketID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, false, fmt.Errorf("未找到策略")
+		}
+		return nil, false, err
+	}
+	_ = json.Unmarshal(subjects, &p.Subjects)
+	_ = json.Unmarshal(resources, &p.Resources)
+	_ = json.Unmarshal(actions, &p.Actions)
+	if len(conditions) > 0 {
+		_ = json.Unmarshal(conditions, &p.Conditions)
+	}
+	if len(approvers) > 0 {
+		_ = json.Unmarshal(approvers, &p.Approvers)
+	}
+	if len(approvedBy) > 0 {
+		_ = json.Unmarshal(approvedBy, &p.ApprovedBy)
+	}
+	if approvedAt.Valid {
+		t := approvedAt.Time
+		p.ApprovedAt = &t
+	}
+
+	if version > 0 && p.Version != version {
+		return nil, false, nil
+	}
+	if p.ApprovalState == "approved" || p.ApprovalState == "rejected" {
+		return &p, false, nil
+	}
+
+	now := time.Now()
+	// 审批人校验：若指定 approvers，仅允许名单内审批
+	if len(p.Approvers) > 0 && approver != "" && !containsIgnoreCase(p.Approvers, approver) {
+		return nil, false, fmt.Errorf("审批人不在 approvers 名单中")
+	}
+	if approver != "" && !containsIgnoreCase(p.ApprovedBy, approver) {
+		p.ApprovedBy = append(p.ApprovedBy, approver)
+	}
+	p.Reason = reason
+	p.TicketID = ticket
+
+	if approve {
+		p.ApprovedSteps++
+		req := p.RequiredApprovals
+		if req <= 0 {
+			req = 1
+		}
+		if p.ApprovedSteps >= req {
+			p.ApprovalState = "approved"
+			p.Approved = true
+			p.ApprovedAt = &now
+		} else {
+			p.ApprovalState = "pending"
+		}
+	} else {
+		p.ApprovalState = "rejected"
+		p.Approved = false
+		p.ApprovedAt = &now
+	}
+
+	approvedByJSON, _ := json.Marshal(p.ApprovedBy)
+	approversJSON, _ := json.Marshal(p.Approvers)
+	var approvedAtVal any
+	if p.ApprovedAt != nil {
+		approvedAtVal = *p.ApprovedAt
+	}
+
+	_, err = tx.ExecContext(ctx, `
+UPDATE policies 
+SET approved=?, reason=?, version=version+1, approval_state=?, approved_steps=?, approved_by=?, approvers=?, approved_at=?, ticket_id=? 
+WHERE id=?`,
+		p.Approved, p.Reason, p.ApprovalState, p.ApprovedSteps, approvedByJSON, approversJSON, approvedAtVal, p.TicketID, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	m.addMetric("policy_approve", 1)
+	p.Version++
+	return &p, true, nil
+}
+
+// Metrics 返回简单指标。
+func (m *MySQLStore) Metrics() map[string]int64 {
+	out := make(map[string]int64, len(m.metrics)+2)
+	for k, v := range m.metrics {
+		out[k] = v
+	}
+	if m.db != nil {
+		stats := m.db.Stats()
+		out["db_open_conns"] = int64(stats.OpenConnections)
+		out["db_in_use"] = int64(stats.InUse)
+		out["db_idle"] = int64(stats.Idle)
+	}
+	return out
+}
+
+func (m *MySQLStore) addMetric(key string, delta int64) {
+	m.metrics[key] += delta
+}
+
 func (m *MySQLStore) NamespaceExists(ctx context.Context, namespace string) (bool, error) {
 	var count int
 	err := m.db.QueryRowContext(ctx, "SELECT COUNT(1) FROM namespaces WHERE namespace=?", namespace).Scan(&count)
@@ -298,6 +473,146 @@ func (m *MySQLStore) NamespaceExists(ctx context.Context, namespace string) (boo
 		return false, err
 	}
 	return count > 0, nil
+}
+
+// CreateNamespace 创建命名空间（存在则忽略更新描述）。
+func (m *MySQLStore) CreateNamespace(ctx context.Context, namespace, desc string) error {
+	if namespace == "" {
+		return fmt.Errorf("命名空间不能为空")
+	}
+	_, err := m.db.ExecContext(ctx, "INSERT INTO namespaces(namespace,description) VALUES(?,?) ON DUPLICATE KEY UPDATE description=VALUES(description)", namespace, desc)
+	if err == nil {
+		m.addMetric("namespace_create", 1)
+	}
+	return err
+}
+
+// ListNamespaces 返回所有命名空间名称。
+func (m *MySQLStore) ListNamespaces(ctx context.Context) ([]string, error) {
+	rows, err := m.db.QueryContext(ctx, "SELECT namespace FROM namespaces ORDER BY id ASC")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var res []string
+	for rows.Next() {
+		var ns string
+		if err := rows.Scan(&ns); err != nil {
+			return nil, err
+		}
+		res = append(res, ns)
+	}
+	return res, rows.Err()
+}
+
+// ReserveIdempotency 记录幂等键，重复返回 false。
+func (m *MySQLStore) ReserveIdempotency(ctx context.Context, scope, key string) (bool, error) {
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, "INSERT INTO idempotency_keys(scope,idem_key,created_at) VALUES(?,?,?)", scope, key, time.Now())
+	if err != nil {
+		if strings.Contains(err.Error(), "Duplicate") {
+			return false, nil
+		}
+		return false, err
+	}
+	m.addMetric("idempotency_reserved", 1)
+	return tx.Commit() == nil, nil
+}
+
+// SaveIdempotencyResponse 更新幂等键对应的响应。
+func (m *MySQLStore) SaveIdempotencyResponse(ctx context.Context, scope, key string, resp map[string]any) error {
+	b, _ := json.Marshal(resp)
+	tx, err := m.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, "UPDATE idempotency_keys SET response=? WHERE scope=? AND idem_key=?", string(b), scope, key); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	m.addMetric("idempotency_saved", 1)
+	return nil
+}
+
+// GetIdempotencyResponse 读取幂等键的缓存响应。
+func (m *MySQLStore) GetIdempotencyResponse(ctx context.Context, scope, key string) (map[string]any, bool, error) {
+	var raw sql.NullString
+	err := m.db.QueryRowContext(ctx, "SELECT response FROM idempotency_keys WHERE scope=? AND idem_key=?", scope, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if !raw.Valid || raw.String == "" {
+		return nil, true, nil
+	}
+	var mResp map[string]any
+	_ = json.Unmarshal([]byte(raw.String), &mResp)
+	return mResp, true, nil
+}
+
+// UpdateQuota 更新配额，返回是否允许。
+func (m *MySQLStore) UpdateQuota(ctx context.Context, policyID int64, actor, namespace, resource, action string, limit int, window time.Duration) (bool, error) {
+	if limit <= 0 {
+		return true, nil
+	}
+	m.addMetric("quota_calls", 1)
+	now := time.Now()
+	windowEnd := now.Truncate(window).Add(window)
+	res, err := m.db.ExecContext(ctx, `
+INSERT INTO policy_quotas(policy_id,actor,namespace,resource,action,used,window_end,created_at,updated_at)
+VALUES(?,?,?,?,?,?,1,?,?)
+ON DUPLICATE KEY UPDATE used=IF(window_end=VALUES(window_end), used+1, 1), window_end=VALUES(window_end), updated_at=VALUES(updated_at)`,
+		policyID, actor, namespace, resource, action, windowEnd, now, now)
+	if err != nil {
+		return false, err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		m.addMetric("quota_denied", 1)
+		return false, nil
+	}
+	var used int
+	if err := m.db.QueryRowContext(ctx, "SELECT used FROM policy_quotas WHERE policy_id=? AND actor=? AND namespace=? AND resource=? AND action=? AND window_end=?", policyID, actor, namespace, resource, action, windowEnd).Scan(&used); err != nil {
+		return false, err
+	}
+	if used > limit {
+		m.addMetric("quota_denied", 1)
+		return false, nil
+	}
+	return true, nil
+}
+
+// ResetQuotas 清理配额计数，支持按命名空间维度治理。
+func (m *MySQLStore) ResetQuotas(ctx context.Context, namespace string) error {
+	query := "DELETE FROM policy_quotas"
+	args := []any{}
+	if namespace != "" {
+		query += " WHERE namespace=?"
+		args = append(args, namespace)
+	}
+	_, err := m.db.ExecContext(ctx, query, args...)
+	if err == nil {
+		m.addMetric("quota_reset", 1)
+	}
+	return err
+}
+
+func containsIgnoreCase(list []string, target string) bool {
+	for _, v := range list {
+		if strings.EqualFold(v, target) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureNamespace 返回命名空间 ID，生产模式要求预先创建命名空间。
